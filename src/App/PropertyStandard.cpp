@@ -28,11 +28,21 @@
 #include <memory>
 #include <list>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include <FCConfig.h>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/math/special_functions/round.hpp>
+
+#ifdef FC_OS_WIN32
+#include <Windows.h>
+#else
+#include <iconv.h>
+#endif
+
+#include <QString>
 
 #include <Base/Console.h>
 #include <Base/Exception.h>
@@ -59,6 +69,156 @@ using namespace App;
 using namespace Base;
 using namespace std;
 
+namespace
+{
+
+bool isPlainAsciiLabel(const std::string& text)
+{
+    return std::all_of(text.begin(), text.end(), [](unsigned char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+            || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '=' || ch == '+'
+            || ch == '.' || ch == ',' || ch == ';' || ch == ' ';
+    });
+}
+
+std::optional<std::string> encodeGbk(const std::string& text)
+{
+    const auto decoded = QString::fromUtf8(text.data(), static_cast<int>(text.size()));
+    if (decoded.toUtf8().toStdString() != text) {
+        return std::nullopt;
+    }
+
+#ifdef FC_OS_WIN32
+    const std::wstring wideText = decoded.toStdWString();
+    BOOL usedDefaultCharacter = FALSE;
+    const int byteLength = WideCharToMultiByte(936, WC_NO_BEST_FIT_CHARS, wideText.data(),
+                                               static_cast<int>(wideText.size()), nullptr, 0,
+                                               nullptr, &usedDefaultCharacter);
+    if (byteLength <= 0 || usedDefaultCharacter) {
+        return std::nullopt;
+    }
+    std::string encoded(byteLength, '\0');
+    if (!WideCharToMultiByte(936, WC_NO_BEST_FIT_CHARS, wideText.data(),
+                             static_cast<int>(wideText.size()), encoded.data(), byteLength,
+                             nullptr, &usedDefaultCharacter)
+        || usedDefaultCharacter) {
+        return std::nullopt;
+    }
+    return encoded;
+#else
+    iconv_t converter = iconv_open("GBK", "UTF-8");
+    if (converter == reinterpret_cast<iconv_t>(-1)) {
+        return std::nullopt;
+    }
+    std::string encoded(text.size() * 2 + 4, '\0');
+    char* input = const_cast<char*>(text.data());
+    char* output = encoded.data();
+    std::size_t inputBytes = text.size();
+    std::size_t outputBytes = encoded.size();
+    const auto result = iconv(converter, &input, &inputBytes, &output, &outputBytes);
+    iconv_close(converter);
+    if (result == static_cast<std::size_t>(-1) || inputBytes != 0) {
+        return std::nullopt;
+    }
+    encoded.resize(encoded.size() - outputBytes);
+    return encoded;
+#endif
+}
+
+std::optional<std::string> decodeGbk(const std::string& text)
+{
+#ifdef FC_OS_WIN32
+    const int wideLength = MultiByteToWideChar(936, MB_ERR_INVALID_CHARS, text.data(),
+                                               static_cast<int>(text.size()), nullptr, 0);
+    if (wideLength <= 0) {
+        return std::nullopt;
+    }
+    std::wstring wideText(wideLength, L'\0');
+    if (!MultiByteToWideChar(936, MB_ERR_INVALID_CHARS, text.data(),
+                             static_cast<int>(text.size()), wideText.data(), wideLength)) {
+        return std::nullopt;
+    }
+    return QString::fromWCharArray(wideText.data(), wideLength).toUtf8().toStdString();
+#else
+    iconv_t converter = iconv_open("UTF-8", "GBK");
+    if (converter == reinterpret_cast<iconv_t>(-1)) {
+        return std::nullopt;
+    }
+    std::string converted(text.size() * 4 + 4, '\0');
+    char* input = const_cast<char*>(text.data());
+    char* output = converted.data();
+    std::size_t inputBytes = text.size();
+    std::size_t outputBytes = converted.size();
+    const auto result = iconv(converter, &input, &inputBytes, &output, &outputBytes);
+    iconv_close(converter);
+    if (result == static_cast<std::size_t>(-1) || inputBytes != 0) {
+        return std::nullopt;
+    }
+    converted.resize(converted.size() - outputBytes);
+    return converted;
+#endif
+}
+
+std::optional<std::string> decodeGbkMojibake(const std::string& text)
+{
+    auto decodeUtf8 = [](const std::string& utf8) -> std::optional<QString> {
+        const auto value = QString::fromUtf8(utf8.data(), static_cast<int>(utf8.size()));
+        if (value.toUtf8().toStdString() != utf8) {
+            return std::nullopt;
+        }
+        return value;
+    };
+
+    auto encodeLatin1 = [](const QString& value) -> std::optional<std::string> {
+        const auto bytes = value.toLatin1();
+        if (QString::fromLatin1(bytes.constData(), bytes.size()) != value) {
+            return std::nullopt;
+        }
+        return std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()));
+    };
+
+    const auto input = decodeUtf8(text);
+    if (!input) {
+        return std::nullopt;
+    }
+
+    if (const auto firstLatin1 = encodeLatin1(*input)) {
+        if (const auto firstUtf8 = decodeUtf8(*firstLatin1)) {
+            if (const auto originalGbkBytes = encodeLatin1(*firstUtf8)) {
+                if (auto recovered = decodeGbk(*originalGbkBytes)) {
+                    return recovered;
+                }
+            }
+        }
+    }
+
+    const auto gbkBytes = encodeGbk(text);
+    if (!gbkBytes) {
+        return std::nullopt;
+    }
+
+    const auto firstUtf8 = decodeUtf8(*gbkBytes);
+    if (!firstUtf8) {
+        return std::nullopt;
+    }
+    const auto firstLatin1 = encodeLatin1(*firstUtf8);
+    if (!firstLatin1) {
+        return std::nullopt;
+    }
+
+    const auto secondUtf8 = decodeUtf8(*firstLatin1);
+    if (!secondUtf8) {
+        return std::nullopt;
+    }
+    const auto originalGbkBytes = encodeLatin1(*secondUtf8);
+    if (!originalGbkBytes) {
+        return std::nullopt;
+    }
+
+    return decodeGbk(*originalGbkBytes);
+}
+
+}
 
 //**************************************************************************
 //**************************************************************************
@@ -1618,13 +1778,21 @@ void PropertyString::setValue(const char* newValue)
         return;
     }
 
-    if (_cValue == newValue) {
+    auto obj = freecad_cast<DocumentObject*>(getContainer());
+    auto doc = freecad_cast<Document*>(getContainer());
+    std::string newValueStr = newValue;
+    if (((obj && this == &obj->Label) || (doc && this == &doc->Label))
+        && !isPlainAsciiLabel(newValueStr)) {
+        if (auto convertedName = decodeGbkMojibake(newValueStr)) {
+            newValueStr = std::move(*convertedName);
+        }
+    }
+
+    if (_cValue == newValueStr) {
         return;
     }
 
     std::vector<std::pair<Property*, std::unique_ptr<Property>>> propChanges;
-    std::string newValueStr = newValue;
-    auto obj = freecad_cast<DocumentObject*>(getContainer());
     bool commit = false;
 
     if (obj && this == &obj->Label) {
@@ -3043,6 +3211,7 @@ void PropertyMaterial::Restore(Base::XMLReader& reader)
     hasSetValue();
 }
 
+
 const char* PropertyMaterial::getEditorName() const
 {
     if (testStatus(MaterialEdit)) {
@@ -3821,4 +3990,3 @@ void PropertyPersistentObject::setValue(const char* type)
     }
     hasSetValue();
 }
-
